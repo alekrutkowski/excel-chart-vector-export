@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Export outputs and temporary files
+charts_svg/
+ExportedCharts/
+*.tmp
+*.temp
+~$*.xls*
+
+# User secrets / licenses
+*.lic
+.env
+.env.*
+
+# Editor and OS state
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+smoke-test-output/

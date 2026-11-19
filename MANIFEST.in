@@ -1,0 +1,6 @@
+include LICENSE README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md PUBLISHING.md
+include requirements-windows.txt requirements-aspose.txt
+include extract_charts.bat
+recursive-include examples *.xlsx
+recursive-include tests *.py
+recursive-include scripts *.ps1

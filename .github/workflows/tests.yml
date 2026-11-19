@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[windows,test]"
+      - name: Check installation
+        run: |
+          python -m pip check
+          python -m compileall -q excel_charts_to_svg.py
+          excel-chart-export --version
+      - name: Run tests (mocked Excel COM, no Excel installation required)
+        run: python -m pytest -q
+
+  inkscape-fallback:
+    name: Real SVG to EMF fallback on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install Inkscape
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y inkscape
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[windows,test]"
+      - name: Verify real Inkscape fallback
+        run: python -m pytest -q tests/test_tool.py -k 'real_inkscape or excel_emf_fallback'

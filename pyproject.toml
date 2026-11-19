@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excel-chart-vector-export"
+version = "1.2.1"
+description = "Extract Excel charts into validated SVG and EMF graphics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Alek Rutkowski", email = "alek.rutkowski@gmail.com" }]
+keywords = ["excel", "charts", "svg", "emf", "vector", "export", "office"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Office/Business",
+]
+
+[project.optional-dependencies]
+windows = ["pywin32>=306; sys_platform == 'win32'", "pymupdf>=1.24"]
+aspose = ["aspose-cells>=25.1"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+excel-chart-export = "excel_charts_to_svg:main"
+
+[tool.setuptools]
+py-modules = ["excel_charts_to_svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
