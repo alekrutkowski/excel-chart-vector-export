@@ -3,14 +3,16 @@
 
 Windows: native Excel COM -> one-chart PDF -> SVG via PyMuPDF;
          chart picture clipboard -> native EMF (with optional Inkscape fallback).
-Windows/Linux: optional licensed Aspose.Cells for Python via Java -> SVG/EMF.
+Cross-platform: optional licensed Aspose.Cells for Python via Java -> SVG/EMF.
+Open source: LibreOffice UNO -> SVG/EMF, Gnumeric ssconvert -> SVG
+             (EMF through optional Inkscape).
 
 The source workbook is always opened read-only and is never saved.
 """
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +20,8 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import posixpath
+import socket
 import re
 import shutil
 import struct
@@ -31,7 +35,7 @@ from uuid import uuid4
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 EXTENSIONS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".xltx", ".xltm", ".xlt"}
 SVG_NS = "http://www.w3.org/2000/svg"
 XL_WORKSHEET = -4167
@@ -68,6 +72,7 @@ class ChartSpec:
     chart: Any = field(repr=False)
     chart_type: str = ""
     name_hint: str = ""
+    name_source: str = "backend"
     host_sheet: Any = field(default=None, repr=False)
     chart_object: Any = field(default=None, repr=False)
 
@@ -88,6 +93,7 @@ class EMFInfo:
     vector_elements: int
     raster_elements: int
     emf_plus_comments: int
+    record_count_difference: int = 0
 
 
 @dataclass
@@ -104,6 +110,7 @@ class Result:
     vector_elements: int | None = None
     raster_elements: int | None = None
     error: str | None = None
+    name_source: str = "backend"
 
 
 def clean_filename(value: str, maximum: int = 80) -> str:
@@ -127,7 +134,7 @@ def chart_label(title: str, object_name: str, position: int, name_hint: str = ""
     if title:
         return title
     object_name = (object_name or "").strip()
-    generic_object = bool(re.fullmatch(r"(?i:chart)(?:\s*\d+)?", object_name))
+    generic_object = bool(re.fullmatch(r"(?i:chart|graph)(?:\s*\d+)?", object_name))
     if object_name and not generic_object:
         return object_name
     if name_hint:
@@ -212,6 +219,158 @@ def count_ooxml_chart_parts(path: Path) -> int | None:
         # A referenced chart has a real on-sheet representation; an orphaned
         # chart part can exist after a chart was deleted in Excel.
         return references if rels_parts else len(chart_parts)
+
+
+# OOXML (Open XML) namespaces. The catalog is a *naming aid* for engines
+# that expose only ordered chart images. A failed match never changes a
+# renderer's actual chart count or fabricates an export.
+PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+DRAW_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+DRAW_MAIN_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _part_target(source_part: str, target: str) -> str:
+    """Resolve a package relationship target, including absolute OPC paths."""
+    return (target.lstrip("/") if target.startswith("/") else
+            posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target)))
+
+
+def _rels_path(part: str) -> str:
+    return posixpath.join(posixpath.dirname(part), "_rels",
+                          posixpath.basename(part) + ".rels")
+
+
+def _rels(archive: ZipFile, part: str) -> dict[str, str]:
+    try:
+        document = ET.fromstring(archive.read(_rels_path(part)))
+    except KeyError:
+        return {}
+    return {r.get("Id", ""): _part_target(part, r.get("Target", ""))
+            for r in document if r.get("TargetMode", "") != "External"}
+
+
+def _chart_metadata(archive: ZipFile, part: str) -> tuple[str, str, str]:
+    """Extract a literal chart title, first series names, and type from OOXML."""
+    try:
+        root = ET.fromstring(archive.read(part))
+    except (KeyError, ET.ParseError):
+        return "", "", ""
+    title_node = root.find(f".//{{{CHART_NS}}}chart/{{{CHART_NS}}}title")
+    title = ""
+    if title_node is not None:
+        title = "".join(t.text or "" for t in title_node.iter()
+                        if t.tag in {f"{{{DRAW_MAIN_NS}}}t", f"{{{CHART_NS}}}v"}).strip()
+    series = root.findall(f".//{{{CHART_NS}}}ser")
+    names = []
+    for row in series[:2]:
+        tx = row.find(f"{{{CHART_NS}}}tx")
+        if tx is not None:
+            name = "".join(t.text or "" for t in tx.iter()
+                           if t.tag in {f"{{{DRAW_MAIN_NS}}}t", f"{{{CHART_NS}}}v"})
+            names.append(name)
+    plot = root.find(f".//{{{CHART_NS}}}plotArea")
+    kind = ""
+    if plot is not None:
+        kind = next((tag.tag.rsplit("}", 1)[-1] for tag in plot
+                     if tag.tag.rsplit("}", 1)[-1].lower().endswith("chart")), "")
+    return title, descriptive_series_names(names), kind
+
+
+def ooxml_chart_catalog(path: Path) -> dict[str, list[ChartSpec]]:
+    """Read spreadsheet, drawing and chart relationships without editing the file.
+
+    Returned entries are sorted by sheet and by the charts' top-left anchor.
+    The order is used only when a renderer exports the same number of charts
+    on that sheet. A different count results in generic names, never in a
+    misleading title assigned from the wrong Excel chart.
+    """
+    if not __import__("zipfile").is_zipfile(path):
+        return {}
+    result: dict[str, list[ChartSpec]] = {}
+    with ZipFile(path) as archive:
+        try:
+            wb = ET.fromstring(archive.read("xl/workbook.xml"))
+        except (KeyError, ET.ParseError):
+            return {}
+        wbrels = _rels(archive, "xl/workbook.xml")
+        for sheet in wb.findall(f".//{{{MAIN_NS}}}sheet"):
+            sheet_name = sheet.get("name", "")
+            sheet_id = sheet.get(f"{{{OFFICE_REL_NS}}}id", "")
+            sheetpart = wbrels.get(sheet_id, "")
+            if not sheetpart:
+                continue
+            try:
+                sheetxml = ET.fromstring(archive.read(sheetpart))
+            except (KeyError, ET.ParseError):
+                continue
+            sheetrels = _rels(archive, sheetpart)
+            records = []
+            order = 0
+            for reference in sheetxml.findall(f".//{{{MAIN_NS}}}drawing"):
+                drawpart = sheetrels.get(reference.get(f"{{{OFFICE_REL_NS}}}id", ""))
+                if not drawpart:
+                    continue
+                try:
+                    drawing = ET.fromstring(archive.read(drawpart))
+                except (KeyError, ET.ParseError):
+                    continue
+                chartrels = _rels(archive, drawpart)
+                for anchor in drawing:
+                    location = anchor.find(f"{{{DRAW_NS}}}from")
+                    def anchor_value(name: str) -> int:
+                        entry = location.find(f"{{{DRAW_NS}}}{name}") if location is not None else None
+                        try:
+                            return int(entry.text or 0) if entry is not None else 0
+                        except ValueError:
+                            return 0
+                    row, col = anchor_value("row"), anchor_value("col")
+                    for chart_ref in anchor.iter(f"{{{CHART_NS}}}chart"):
+                        target = chartrels.get(chart_ref.get(f"{{{OFFICE_REL_NS}}}id", ""))
+                        if not target:
+                            continue
+                        name_element = next(anchor.iter(f"{{{DRAW_NS}}}cNvPr"), None)
+                        name = name_element.get("name", "") if name_element is not None else ""
+                        title, series_hint, kind = _chart_metadata(archive, target)
+                        order += 1
+                        records.append((row, col, order, ChartSpec(sheet_name, name,
+                                       title, order, None, chart_type=kind,
+                                       name_hint=series_hint, name_source="ooxml_position")))
+            if records:
+                records.sort(key=lambda entry: entry[:3])
+                catalog = [spec for _, _, _, spec in records]
+                for i, spec in enumerate(catalog, 1):
+                    spec.position = i
+                result[sheet_name] = catalog
+    return result
+
+
+def match_chart_metadata(source: Path, specs: list[ChartSpec]) -> list[ChartSpec]:
+    """Use OOXML names only for sheets with an unambiguous 1:1 chart count.
+
+    Both Gnumeric and LibreOffice enumerate shapes in page order, which may
+    differ from OOXML order in some documents. This is therefore a heuristic;
+    the name_source records that provenance for the manifest.
+    """
+    catalog = ooxml_chart_catalog(source)
+    indexed: dict[str, list[ChartSpec]] = defaultdict(list)
+    for spec in specs:
+        indexed[spec.sheet].append(spec)
+    for sheet, rows in indexed.items():
+        candidates = catalog.get(sheet, [])
+        if len(candidates) != len(rows):
+            continue
+        for current, meta in zip(rows, candidates):
+            if not current.title and meta.title:
+                current.title = meta.title
+                current.name_source = "ooxml_position"
+            if not current.name_hint and meta.name_hint:
+                current.name_hint = meta.name_hint
+            if not current.chart_type and meta.chart_type:
+                current.chart_type = meta.chart_type
+    return specs
 
 
 def safe_attr(obj: Any, attr: str, fallback: Any = "") -> Any:
@@ -375,7 +534,8 @@ def svg_inspect_and_label(path: Path, *, title: str, description: str, require_v
                    vector_count, raster_count, external_count)
 
 
-def emf_inspect(path: Path, *, require_vector: bool = True) -> EMFInfo:
+def emf_inspect(path: Path, *, require_vector: bool = True,
+                allow_lo_record_discrepancy: bool = False) -> EMFInfo:
     """Reject renamed images, truncated files, malformed records and raster-only EMFs.
 
     EMF is a *binary record stream*, not an XML/SVG wrapper. The header must
@@ -415,13 +575,15 @@ def emf_inspect(path: Path, *, require_vector: bool = True) -> EMFInfo:
             emf_plus += 1
         last_type = rec_type
         offset += rec_size
-    if total != declared_records or last_type != 14:
+    difference = total - declared_records
+    if last_type != 14 or (difference != 0 and not (
+            allow_lo_record_discrepancy and difference == 1)):
         raise ExtractionError("EMF record count mismatch or missing final EOF record")
     if require_vector and vectors == 0:
         raise ExtractionError(
             "No classic GDI vector drawing records found in EMF; possible raster-only "
             "or EMF+-only output (use --allow-raster only if acceptable)")
-    return EMFInfo(total, vectors, rasters, emf_plus)
+    return EMFInfo(total, vectors, rasters, emf_plus, difference)
 
 
 def clipboard_sequence() -> int | None:
@@ -856,23 +1018,274 @@ class AsposeBackend:
             self._jpype.shutdownJVM()
 
 
+class GnumericBackend:
+    """Gnumeric ssconvert renders all workbook charts to genuine SVG files.
+
+    Gnumeric's graph export is batch-oriented. We render to an isolated temp
+    folder once per workbook, then transfer individually validated files.
+    Native EMF is unavailable; Inkscape provides a vector SVG-to-EMF bridge.
+    """
+    name = "gnumeric"
+
+    def __init__(self, *, executable: Path | None = None,
+                 inkscape_path: Path | None = None,
+                 formats: tuple[str, ...] = ("svg",), timeout: int = 300):
+        self.executable = str(executable) if executable else shutil.which("ssconvert")
+        if not self.executable or (executable and not executable.is_file()):
+            raise ExtractionError("Gnumeric requires 'ssconvert' on PATH (or --ssconvert PATH)")
+        self.inkscape = inkscape_executable(inkscape_path)
+        if "emf" in formats and self.inkscape is None:
+            raise ExtractionError("Gnumeric supports SVG natively; EMF requires Inkscape "
+                                  "(install it or use --inkscape PATH)")
+        self.timeout = timeout
+        self._scratch = tempfile.TemporaryDirectory(prefix="gnumeric-charts-")
+        self._folders: list[Path] = []
+
+    def open(self, path: Path) -> list[ChartSpec]:
+        working = Path(self._scratch.name) / f"book_{len(self._folders):04d}"
+        self._folders.append(working)
+        working.mkdir(parents=True, exist_ok=True)
+        # %s is the spreadsheet name and %n the export index. Gnumeric
+        # explicitly documents both substitutions and export ordering.
+        template = working / "chart__%s__%n.svg"
+        command = [self.executable, "--export-graphs", str(path), str(template)]
+        try:
+            reply = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=self.timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ExtractionError(f"Gnumeric chart export failed: {exc}") from exc
+        if reply.returncode:
+            reason = (reply.stderr or reply.stdout or "unknown error").strip()
+            raise ExtractionError(f"Gnumeric ssconvert failed ({reply.returncode}): {reason}")
+        sheets = []
+        names = set(ooxml_chart_catalog(path))
+        output_files = sorted(working.glob("chart__*.svg"))
+        for file in output_files:
+            stem = file.name[len("chart__"):-len(".svg")]
+            # %n is an integer; split from the right, allowing '__' in names.
+            sheet_name, separator, number = stem.rpartition("__")
+            if separator and number.isdecimal() and sheet_name:
+                position = int(number)
+            else:
+                sheet_name = "Unidentified sheet"
+                position = len(sheets) + 1
+            if names and sheet_name not in names:
+                # The workbook may include sheets with no chart definitions in
+                # the catalog, e.g. an unsupported chart type; never guess.
+                pass
+            sheets.append(ChartSpec(sheet_name, f"Graph {position}", "", position,
+                                    {"svg": str(file)}, name_source="gnumeric_sheet_index"))
+        return match_chart_metadata(path, sorted(sheets, key=lambda x: (
+            x.sheet.casefold(), x.position)))
+
+    def enumerate(self, workbook: list[ChartSpec]) -> Iterator[ChartSpec]:
+        return iter(workbook)
+
+    def render(self, spec: ChartSpec, destination: Path) -> str:
+        svg = Path(spec.chart["svg"])
+        if destination.suffix.lower() == ".svg":
+            shutil.copyfile(svg, destination)
+            return "gnumeric_ssconvert_svg"
+        if destination.suffix.lower() == ".emf":
+            if self.inkscape is None:
+                raise ExtractionError("EMF conversion requires Inkscape")
+            inkscape_svg_to_emf(svg, destination, self.inkscape)
+            return "gnumeric_inkscape_svg_emf"
+        raise ExtractionError(f"Unsupported output format: {destination.suffix}")
+
+    def close_workbook(self, book: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        self._scratch.cleanup()
+
+
+def discover_uno_python(explicit: Path | None = None) -> str | None:
+    """Find a Python interpreter with LibreOffice's actual UNO bridge.
+
+    On Debian/Ubuntu, this is often /usr/bin/python3 even if the application
+    uses a virtual environment. On Windows, use --uno-python with an interpreter
+    whose Python version is compatible with the LibreOffice pyuno extension.
+    """
+    if explicit is not None:
+        candidates = [str(explicit)]
+    else:
+        candidates = [sys.executable]
+        if os.name != "nt":
+            candidates.append("/usr/bin/python3")
+        candidates.extend(x for x in (shutil.which("python3"), shutil.which("python")) if x)
+        if os.name == "nt":
+            for env in ("ProgramFiles", "ProgramFiles(x86)"):
+                root = os.environ.get(env)
+                if root:
+                    candidates.append(str(Path(root) / "LibreOffice" / "program" / "python.exe"))
+    for executable in dict.fromkeys(candidates):
+        try:
+            if not Path(executable).is_file():
+                continue
+            check = subprocess.run([executable, "-c", "import uno"],
+                                   capture_output=True, timeout=8, check=False)
+            if check.returncode == 0:
+                return executable
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+class LibreOfficeBackend:
+    """LibreOffice Calc renders individual OLE chart shapes through UNO.
+
+    Uses an isolated headless LibreOffice profile and a separate helper Python
+    with a working `uno` module, without importing UNO into the caller's env.
+    Both SVG and EMF use native GraphicExportFilter vector MIME types.
+    """
+    name = "libreoffice"
+
+    def __init__(self, *, soffice_path: Path | None = None,
+                 uno_python: Path | None = None,
+                 formats: tuple[str, ...] = ("svg",), timeout: int = 300):
+        self.soffice = str(soffice_path) if soffice_path else (
+            shutil.which("soffice") or shutil.which("libreoffice"))
+        if not self.soffice or (soffice_path and not soffice_path.is_file()):
+            raise ExtractionError("LibreOffice requires soffice on PATH (or --soffice PATH)")
+        self.python = discover_uno_python(uno_python)
+        if self.python is None:
+            raise ExtractionError("Cannot find a Python interpreter with the LibreOffice UNO "
+                                  "module. Install python3-uno, or set --uno-python PATH.")
+        self.helper = Path(__file__).with_name("libreoffice_uno_worker.py")
+        if not self.helper.is_file():
+            raise ExtractionError("LibreOffice backend helper libreoffice_uno_worker.py "
+                                  "must be installed next to excel_charts_to_svg.py")
+        self.formats = formats
+        self.timeout = timeout
+        self._scratch = tempfile.TemporaryDirectory(prefix="libreoffice-charts-")
+        self._folders: list[Path] = []
+        # An exclusive short-lived listener on the loopback interface. The
+        # profile is unique, so unrelated user LibreOffice sessions are safe.
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        profile = Path(self._scratch.name) / "user-profile"
+        from urllib.parse import quote
+        profile_url = profile.resolve().as_uri()
+        self._process = None
+        try:
+            self._process = subprocess.Popen(
+                [self.soffice, f"-env:UserInstallation={profile_url}", "--headless",
+                 f"--accept=socket,host=127.0.0.1,port={self.port};urp;StarOffice.ServiceManager",
+                 "--norestore", "--nodefault", "--nofirststartwizard", "--nolockcheck"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self._scratch.cleanup()
+            raise ExtractionError(f"Cannot start LibreOffice: {exc}") from exc
+
+    def open(self, path: Path) -> list[ChartSpec]:
+        folder = Path(self._scratch.name) / f"book_{len(self._folders):04d}"
+        self._folders.append(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        manifest = folder / "exports.json"
+        requested = "both" if len(self.formats) == 2 else self.formats[0]
+        args = [self.python, str(self.helper), "--port", str(self.port),
+                "--input", str(path), "--output", str(folder),
+                "--formats", requested, "--manifest", str(manifest)]
+        try:
+            finished = subprocess.run(args, capture_output=True, text=True,
+                                      timeout=self.timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ExtractionError(f"LibreOffice UNO export failed: {exc}") from exc
+        if finished.returncode or not manifest.is_file():
+            detail = (finished.stderr or finished.stdout or
+                      "No chart inventory returned").strip()
+            raise ExtractionError(f"LibreOffice UNO export failed: {detail[-1600:]}")
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        specs = []
+        for item in data["charts"]:
+            specs.append(ChartSpec(item["sheet"], item["object_name"], item["title"],
+                                   item["position"], item, item["chart_type"],
+                                   name_source="libreoffice"))
+        return match_chart_metadata(path, specs)
+
+    def enumerate(self, workbook: list[ChartSpec]) -> Iterator[ChartSpec]:
+        return iter(workbook)
+
+    def render(self, spec: ChartSpec, destination: Path) -> str:
+        ext = destination.suffix.lstrip(".").lower()
+        item = spec.chart
+        if ext not in item["files"]:
+            raise ExtractionError(item.get("errors", {}).get(ext) or
+                                  f"LibreOffice did not export the chart as {ext}")
+        source = Path(item["files"][ext])
+        if not source.is_file():
+            raise ExtractionError(f"LibreOffice export disappeared: {source}")
+        shutil.copyfile(source, destination)
+        return f"libreoffice_uno_{ext}"
+
+    def close_workbook(self, book: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        if self._process is not None:
+            # The wrapper process may exit before soffice.bin on Windows;
+            # request shutdown through UNO first. Then stop the launcher.
+            with suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run([self.python, str(self.helper), "--port",
+                                str(self.port), "--shutdown"],
+                               capture_output=True, timeout=9, check=False)
+            if self._process.poll() is None:
+                with suppress(OSError):
+                    self._process.terminate()
+                with suppress(subprocess.TimeoutExpired, OSError):
+                    self._process.wait(timeout=5)
+                if self._process.poll() is None:
+                    with suppress(OSError):
+                        self._process.kill()
+        self._scratch.cleanup()
+
+
 def backend_for(engine: str, *, crop: str, keep_text: bool,
                 license_path: Path | None, show_excel: bool = False,
                 inkscape_path: Path | None = None,
-                require_vector: bool = True) -> ExcelBackend | AsposeBackend:
+                require_vector: bool = True, formats: tuple[str, ...] = ("svg",),
+                ssconvert_path: Path | None = None, soffice_path: Path | None = None,
+                uno_python: Path | None = None,
+                timeout: int = 300) -> Any:
     if engine == "excel":
         return ExcelBackend(crop, keep_text, show_excel=show_excel,
                             inkscape_path=inkscape_path, require_vector=require_vector)
     if engine == "aspose":
         return AsposeBackend(license_path)
+    if engine == "gnumeric":
+        return GnumericBackend(executable=ssconvert_path, inkscape_path=inkscape_path,
+                               formats=formats, timeout=timeout)
+    if engine == "libreoffice":
+        return LibreOfficeBackend(soffice_path=soffice_path, uno_python=uno_python,
+                                  formats=formats, timeout=timeout)
+    if engine != "auto":
+        raise ExtractionError(f"Unknown rendering engine: {engine}")
+    reasons: list[str] = []
     if sys.platform.startswith("win"):
         try:
             return ExcelBackend(crop, keep_text, show_excel=show_excel,
-                                inkscape_path=inkscape_path,
-                                require_vector=require_vector)
+                                inkscape_path=inkscape_path, require_vector=require_vector)
         except ExtractionError as exc:
-            print(f"Note: native Excel unavailable ({exc}); trying Aspose.Cells", file=sys.stderr)
-    return AsposeBackend(license_path)
+            reasons.append(f"Excel: {exc}")
+    for name, create in (
+        ("LibreOffice", lambda: LibreOfficeBackend(
+            soffice_path=soffice_path, uno_python=uno_python,
+            formats=formats, timeout=timeout)),
+        ("Gnumeric", lambda: GnumericBackend(
+            executable=ssconvert_path, inkscape_path=inkscape_path,
+            formats=formats, timeout=timeout)),
+        ("Aspose.Cells", lambda: AsposeBackend(license_path)),
+    ):
+        try:
+            selected = create()
+            print(f"Note: --engine auto selected {selected.name}", file=sys.stderr)
+            return selected
+        except ExtractionError as exc:
+            reasons.append(f"{name}: {exc}")
+    raise ExtractionError("No usable export engine. " + "; ".join(reasons))
 
 
 def workbook_dirs(inputs: list[Path], output_dir: Path) -> dict[Path, Path]:
@@ -890,14 +1303,19 @@ def workbook_dirs(inputs: list[Path], output_dir: Path) -> dict[Path, Path]:
 def process(inputs: list[Path], *, output: Path, engine: str, crop: str,
             keep_text: bool, require_vector: bool, no_overwrite: bool,
             no_audit: bool, license_path: Path | None, show_excel: bool = False,
-            output_format: str = "svg", inkscape_path: Path | None = None) -> dict[str, Any]:
+            output_format: str = "svg", inkscape_path: Path | None = None,
+            ssconvert_path: Path | None = None, soffice_path: Path | None = None,
+            uno_python: Path | None = None, timeout: int = 300) -> dict[str, Any]:
     if output_format not in {"svg", "emf", "both"}:
         raise ExtractionError(f"Unsupported output format: {output_format}")
     formats = ("svg", "emf") if output_format == "both" else (output_format,)
     output.mkdir(parents=True, exist_ok=True)
     backend = backend_for(engine, crop=crop, keep_text=keep_text,
                           license_path=license_path, show_excel=show_excel,
-                          inkscape_path=inkscape_path, require_vector=require_vector)
+                          inkscape_path=inkscape_path, require_vector=require_vector,
+                          formats=formats, ssconvert_path=ssconvert_path,
+                          soffice_path=soffice_path, uno_python=uno_python,
+                          timeout=timeout)
     report: dict[str, Any] = {
         "tool": "excel-charts-to-svg-emf", "version": VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -942,7 +1360,8 @@ def process(inputs: list[Path], *, output: Path, engine: str, crop: str,
                     for fmt in formats:
                         dst = base.with_suffix(f".{fmt}")
                         record = Result(str(input_file), spec.sheet, spec.object_name,
-                                        spec.title, spec.chart_type, str(dst), "ok", format=fmt)
+                                        spec.title, spec.chart_type, str(dst), "ok", format=fmt,
+                                        name_source=spec.name_source)
                         if no_overwrite and dst.exists():
                             record.status = "error"
                             record.error = f"Output file exists and --no-overwrite is set: {dst}"
@@ -962,7 +1381,8 @@ def process(inputs: list[Path], *, output: Path, engine: str, crop: str,
                                                          f"sheet: {spec.sheet}; chart: {spec.object_name}"),
                                             require_vector=require_vector)
                                     else:
-                                        info = emf_inspect(intermediate, require_vector=require_vector)
+                                        info = emf_inspect(intermediate, require_vector=require_vector,
+                                                           allow_lo_record_discrepancy=(backend.name == "libreoffice"))
                                     os.replace(intermediate, dst)
                                 record.vector_elements = info.vector_elements
                                 record.raster_elements = info.raster_elements
@@ -976,14 +1396,27 @@ def process(inputs: list[Path], *, output: Path, engine: str, crop: str,
                                     report["warnings"].append(
                                         f"{dst}: EMF made from Excel PDF/SVG via Inkscape "
                                         "because native Excel clipboard EMF was unavailable")
+                                if spec.name_source == "ooxml_position":
+                                    if not any("OOXML positional naming" in w for w in report["warnings"]):
+                                        report["warnings"].append(
+                                            "OOXML positional naming was used for some charts. "
+                                            "Names may be mismatched if a renderer reordered charts; "
+                                            "check name_source in manifest.json")
+                                if fmt == "emf" and info.record_count_difference:
+                                    if not any("EMF count discrepancy" in w for w in report["warnings"]):
+                                        report["warnings"].append(
+                                            "LibreOffice EMF count discrepancy: some valid EMF "
+                                            "files declare one fewer header record than present "
+                                            "in their EOF-terminated stream")
                                 if info.raster_elements:
                                     report["warnings"].append(
                                         f"{dst}: includes {info.raster_elements} "
                                         f"raster {'record' if fmt == 'emf' else 'image element'}(s)")
                                 if fmt == "emf" and info.emf_plus_comments:
-                                    report["warnings"].append(
-                                        f"{dst}: contains {info.emf_plus_comments} EMF+ comment(s); "
-                                        "their drawing commands are not classified by the validator")
+                                    if not any("EMF+ commands" in w for w in report["warnings"]):
+                                        report["warnings"].append(
+                                            "Some EMF files contain EMF+ commands that are not "
+                                            "fully classified by the structural validator")
                             except Exception as exc:
                                 record.status = "error"
                                 record.error = str(exc)
@@ -1041,8 +1474,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-o", "--output", type=Path, default=Path("charts_svg"),
                         help="Output directory; each workbook gets its own subfolder")
     parser.add_argument("-r", "--recursive", action="store_true", help="Scan directory inputs recursively")
-    parser.add_argument("--engine", choices=["auto", "excel", "aspose"], default="auto",
-                        help="Excel uses native Excel PDF/clipboard; Aspose works on Windows/Linux with a license")
+    parser.add_argument("--engine", choices=["auto", "excel", "libreoffice", "gnumeric", "aspose"], default="auto",
+                        help="Choose renderer: native Excel, LibreOffice UNO, Gnumeric ssconvert or Aspose")
+    parser.add_argument("--ssconvert", type=Path, help="Gnumeric ssconvert executable")
+    parser.add_argument("--soffice", type=Path, help="LibreOffice soffice executable")
+    parser.add_argument("--uno-python", type=Path,
+                        help="Python interpreter with importable LibreOffice UNO bridge")
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="Maximum seconds per workbook for open-source renderer subprocesses")
     parser.add_argument("--format", choices=["svg", "emf", "both"], default="svg",
                         help="Output vector format(s); SVG-only preserves previous behavior")
     parser.add_argument("--aspose-license", type=Path, help="Path to an Aspose.Cells license file")
@@ -1061,6 +1500,13 @@ def main(argv: list[str] | None = None) -> int:
     inputs = collect_inputs(args.inputs, args.recursive)
     if not inputs:
         parser.error("No Excel workbook files matched your inputs")
+    if args.timeout < 1:
+        parser.error("--timeout must be a positive integer")
+    for custom, flag in ((args.ssconvert, "--ssconvert"),
+                         (args.soffice, "--soffice"),
+                         (args.uno_python, "--uno-python")):
+        if custom and not custom.is_file():
+            parser.error(f"{flag} executable not found: {custom}")
     if args.aspose_license and not args.aspose_license.is_file():
         parser.error(f"Aspose license file not found: {args.aspose_license}")
     if args.inkscape and not args.inkscape.is_file():
@@ -1071,7 +1517,9 @@ def main(argv: list[str] | None = None) -> int:
             require_vector=not args.allow_raster, no_overwrite=args.no_overwrite,
             no_audit=args.no_audit, license_path=args.aspose_license,
             show_excel=args.show_excel, output_format=args.format,
-            inkscape_path=args.inkscape)
+            inkscape_path=args.inkscape,
+            ssconvert_path=args.ssconvert, soffice_path=args.soffice,
+            uno_python=args.uno_python, timeout=args.timeout)
         return 2 if report["errors"] else 0
     except (ExtractionError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

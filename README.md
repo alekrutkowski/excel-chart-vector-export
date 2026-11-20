@@ -2,16 +2,57 @@
 
 Export native Excel charts from one or more workbooks to **individual SVG, EMF, or both**, with descriptive filenames and a machine-readable completeness report.
 
-The tool uses **Microsoft Excel on Windows** for the closest match to Excel's original chart appearance. An optional **Aspose.Cells** backend is available on Windows, Linux and macOS. Exports are checked for valid SVG/EMF structure, and raster-only files are rejected by default.
+**No Microsoft Excel or paid libraries are required** when using the new **LibreOffice Calc** backend (SVG and EMF) or **Gnumeric** backend (SVG, with optional Inkscape conversion to EMF). The original Microsoft Excel backend remains available on Windows for the closest match to Excel's chart appearance, and Aspose.Cells remains optional. Exports undergo SVG/EMF structural validation; raster-only files are rejected by default.
+
+**Verified on LibreOffice 25.2 (Linux):** the bundled 47-chart test workbook produced **47 vector SVGs and 47 vector EMFs**, with zero extraction errors. This does not guarantee the same result with other Excel files or LibreOffice versions. Gnumeric integration is unit-tested but has not been run against an installed `ssconvert` in this test environment.
 
 ## Requirements
 
-| Backend                          | Where it runs                        | Required software                                                             | Formats     |
-| -------------------------------- | ------------------------------------ | ----------------------------------------------------------------------------- | ----------- |
-| Native Excel (`--engine excel`)  | Windows, interactive desktop session | Python 3.10+, desktop Microsoft Excel, `pywin32`, `PyMuPDF`                   | SVG and EMF |
-| Aspose.Cells (`--engine aspose`) | Windows, Linux, macOS                | Python 3.10+, Java runtime, `aspose-cells`; paid license for unrestricted use | SVG and EMF |
+| Backend                                  | Where it runs                                    | Required software                                                             | Formats                   |
+| ---------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------- | ------------------------- |
+| **LibreOffice (`--engine libreoffice`)** | Linux, Windows; macOS with compatible UNO Python | Python 3.10+, LibreOffice Calc, `soffice`, Python UNO bridge                  | **SVG and EMF**, directly |
+| **Gnumeric (`--engine gnumeric`)**       | Linux, including WSL2 on Windows                 | Python 3.10+, Gnumeric's `ssconvert`; optional Inkscape                       | **SVG**; EMF via Inkscape |
+| Native Excel (`--engine excel`)          | Windows, interactive desktop session             | Python 3.10+, desktop Microsoft Excel, `pywin32`, `PyMuPDF`                   | SVG and EMF               |
+| Aspose.Cells (`--engine aspose`)         | Windows, Linux, macOS                            | Python 3.10+, Java runtime, `aspose-cells`; paid license for unrestricted use | SVG and EMF               |
 
-An optional **Inkscape** installation provides an SVG-to-EMF fallback if Excel does not supply an enhanced metafile on the clipboard. The default `--engine auto` tries Excel first on Windows and otherwise uses Aspose.Cells, including a fallback when Excel cannot start. If Aspose runs without a license, evaluation restrictions and watermarks can apply; the manifest warns about this.
+**Inkscape** provides SVG-to-EMF conversion for Gnumeric and a fallback for native Excel. The default `--engine auto` selects the first backend that can be initialized: **Excel on Windows**, then **LibreOffice**, **Gnumeric**, and **Aspose.Cells**. If the chosen renderer later fails to import or draw a chart, the failure is reported; `auto` does not mix different renderers inside a workbook. Explicitly choose `--engine` when reproducibility matters. Aspose evaluation restrictions and watermarks can apply without a commercial license.
+
+## Quick start: LibreOffice (fully open source)
+
+On Ubuntu / WSL2 (native Linux Python and LibreOffice):
+
+```bash
+sudo apt update
+sudo apt install libreoffice-calc python3-uno
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/python excel_charts_to_svg.py ./Report.xlsx \
+    --engine libreoffice --format both -o ./ExportedCharts
+```
+
+The tool launches an **isolated headless LibreOffice instance**, opens the supplied workbook read-only with macro execution and link updating disabled, and exports each chart shape through LibreOffice's `GraphicExportFilter`. **SVG and EMF are both native vector exports**, not screenshots or file-extension tricks. The LibreOffice UNO bridge often belongs to the *system* Python rather than your venv; the script finds a compatible interpreter automatically (usually `/usr/bin/python3` on Ubuntu). If necessary, specify `--uno-python /path/to/python3`, `--soffice /path/to/soffice`, and adjust `--timeout` (default: 300 seconds per workbook).
+
+On Windows, install LibreOffice and use the corresponding `soffice.exe` with `--soffice`. You must also provide a Python interpreter that can `import uno`, using `--uno-python` if it is not detected automatically; Windows LibreOffice installers do not necessarily include a matching, standalone Python interpreter. The normal Windows Python used to run the exporter can still be in a virtual environment. See [LibreOffice's UNO developer documentation](https://api.libreoffice.org/docs/idl/ref/servicecom_1_1sun_1_1star_1_1drawing_1_1GraphicExportFilter.html).
+
+### Gnumeric (simplest headless SVG export)
+
+On Ubuntu / WSL2:
+
+```bash
+sudo apt install gnumeric
+python3 excel_charts_to_svg.py ./Report.xlsx \
+    --engine gnumeric --format svg -o ./ExportedCharts
+```
+
+To request **both SVG and EMF**, also install Inkscape and use `--format both`. Gnumeric's `ssconvert --export-graphs` produces the SVGs; Inkscape converts each genuine SVG to a genuine EMF. Without Inkscape, `--engine gnumeric --format emf|both` stops with a clear dependency error. Gnumeric cannot export EMF natively through `ssconvert`.
+
+```bash
+sudo apt install gnumeric inkscape
+python3 excel_charts_to_svg.py ./Report.xlsx \
+    --engine gnumeric --format both -o ./ExportedCharts
+```
+
+The Gnumeric backend names charts by matching Gnumeric's sheet/index output with chart titles recorded in OOXML, **only if each sheet has the expected number of charts**. This assumes the renderer's top-to-bottom, left-to-right ordering is unchanged. When the mapping cannot be trusted, generic numbered names are used rather than silently assigning the wrong title. The `name_source` field in `manifest.json` reveals the naming method. Gnumeric may not import every chart type supported by Excel; count mismatches are reported as errors.
 
 ## Quick start: Windows
 
@@ -53,7 +94,7 @@ The legacy dependency installation also remains supported: `py -3 -m pip install
 
 Multiple explicit input paths and globs are also supported. The tool uses the files **you pass**; it does not automatically scan every workbook currently open in Excel. The native backend starts a separate Excel automation instance and opens each input read-only.
 
-### Linux or macOS: optional Aspose backend
+### Optional Aspose backend
 
 ```bash
 python3 -m venv .venv
@@ -87,9 +128,11 @@ The original workbooks are opened read-only, macro execution is disabled for nat
 
 - **SVG (Excel backend):** Excel chart exported as a one-page PDF, converted into SVG vector drawing elements by PyMuPDF. By default, text becomes paths for portability; `--keep-text` preserves live SVG text at the expense of font portability.
 - **EMF (Excel backend):** Excel's `CopyPicture` requests a metafile, and the binary Windows `CF_ENHMETAFILE` clipboard format is captured and validated. On failure, the optional Inkscape fallback converts a vector SVG to EMF.
+- **LibreOffice backend:** reads `.xlsx` with Calc and renders individual chart shapes directly to **SVG** (`image/svg+xml`) and **EMF** (`image/x-emf`) with UNO's `GraphicExportFilter`. The vector paths and text reflect LibreOffice's rendering, which can differ from Excel.
+- **Gnumeric backend:** exports individual SVGs using `ssconvert --export-graphs`. For EMF, Inkscape converts these SVGs to vector EMFs; Gnumeric does not offer a native EMF chart exporter.
 - **Aspose backend:** chart rendering directly to SVG or EMF, using Aspose.Cells.
 
-A genuine vector container can still contain **raster components**, for instance image fills and chart effects. The tool counts recognized vector and raster elements and reports raster content in the manifest. By default, output with no detected vector drawing records is rejected; `--allow-raster` relaxes that check. SVG/EMF validation is **structural**, not a guarantee of visual fidelity or full editability in another application. EMF+ drawing commands are not fully classified, so some vector-rich EMF+ output may be rejected conservatively.
+A genuine vector container can still contain **raster components**, for instance image fills and chart effects. The tool counts recognized vector and raster elements and reports raster content in the manifest. By default, output with no detected vector drawing records is rejected; `--allow-raster` relaxes that check. SVG/EMF validation is **structural**, not a guarantee of visual fidelity or full editability in another application. EMF+ drawing commands are not fully classified, so some vector-rich EMF+ output may be rejected conservatively. Some LibreOffice-generated EMFs declare **one fewer record in the header** than is present in their complete, EOF-terminated record stream; the LibreOffice backend accepts only this precise discrepancy and reports a warning. All other backends use strict EMF record-count checking.
 
 **Important:** Native EMF export **replaces the global Windows clipboard contents**. Avoid copying or pasting in other applications while it runs. This does not apply to SVG-only export or the Aspose backend. If Excel cannot render headlessly, retry with `--show-excel` in a normal interactive session.
 
@@ -97,34 +140,40 @@ A genuine vector container can still contain **raster components**, for instance
 
 ```text
 excel-chart-export INPUT [INPUT ...] [-o OUTPUT] [--recursive]
-                   [--engine auto|excel|aspose] [--format svg|emf|both]
-                   [--aspose-license FILE] [--inkscape FILE]
+                   [--engine auto|excel|libreoffice|gnumeric|aspose]
+                   [--format svg|emf|both] [--aspose-license FILE]
+                   [--inkscape FILE] [--ssconvert FILE] [--soffice FILE]
+                   [--uno-python FILE] [--timeout SECONDS]
                    [--crop auto|none] [--keep-text] [--show-excel]
                    [--allow-raster] [--no-overwrite] [--no-audit]
                    [--version]
 ```
 
-| Option                         | Meaning                                                                  |
-| ------------------------------ | ------------------------------------------------------------------------ |
-| `--format svg\|emf\|both`      | Output format(s). Default: `svg`, for backward compatibility.            |
-| `-o, --output DIR`             | Destination directory. Default: `charts_svg`.                            |
-| `-r, --recursive`              | Search within input directories recursively.                             |
-| `--engine auto\|excel\|aspose` | Rendering backend. `auto` selects based on platform and availability.    |
-| `--aspose-license FILE`        | Aspose.Cells license file for licensed rendering.                        |
-| `--inkscape FILE`              | Inkscape executable for the optional EMF fallback.                       |
-| `--crop auto\|none`            | Automatic PDF whitespace trimming; `none` preserves the PDF page bounds. |
-| `--keep-text`                  | Retain text objects in SVG instead of converting glyphs into paths.      |
-| `--show-excel`                 | Make the automated Excel instance visible during export.                 |
-| `--allow-raster`               | Accept a container with no detected vector drawing records.              |
-| `--no-overwrite`               | Treat an existing target file as an error rather than overwriting it.    |
-| `--no-audit`                   | Disable the OOXML chart-definition count cross-check.                    |
-| `--version`                    | Print version.                                                           |
+| Option                                                | Meaning                                                                                              |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--format svg\|emf\|both`                             | Output format(s). Default: `svg`, for backward compatibility.                                        |
+| `-o, --output DIR`                                    | Destination directory. Default: `charts_svg`.                                                        |
+| `-r, --recursive`                                     | Search within input directories recursively.                                                         |
+| `--engine auto\|excel\|libreoffice\|gnumeric\|aspose` | Rendering backend. `auto` tries installed/usable engines in that order, with Excel first on Windows. |
+| `--aspose-license FILE`                               | Aspose.Cells license file for licensed rendering.                                                    |
+| `--inkscape FILE`                                     | Inkscape executable for Gnumeric EMF and Excel EMF fallback.                                         |
+| `--ssconvert FILE`                                    | Gnumeric `ssconvert` executable (default: search `PATH`).                                            |
+| `--soffice FILE`                                      | LibreOffice `soffice` executable (default: search `PATH`).                                           |
+| `--uno-python FILE`                                   | Python interpreter with LibreOffice's UNO bridge available.                                          |
+| `--timeout SECONDS`                                   | Per-workbook subprocess timeout for LibreOffice/Gnumeric (default: 300).                             |
+| `--crop auto\|none`                                   | Automatic PDF whitespace trimming; `none` preserves the PDF page bounds.                             |
+| `--keep-text`                                         | Retain text objects in SVG instead of converting glyphs into paths.                                  |
+| `--show-excel`                                        | Make the automated Excel instance visible during export.                                             |
+| `--allow-raster`                                      | Accept a container with no detected vector drawing records.                                          |
+| `--no-overwrite`                                      | Treat an existing target file as an error rather than overwriting it.                                |
+| `--no-audit`                                          | Disable the OOXML chart-definition count cross-check.                                                |
+| `--version`                                           | Print version.                                                                                       |
 
-Supported inputs: `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xltx`, `.xltm`, `.xlt`. On Windows the native backend searches embedded chart objects, charts in grouped drawing objects when accessible, and standalone chart sheets. Pasted pictures of charts, sparklines and non-chart shapes are outside the scope. The Aspose backend enumerates charts in worksheets; standalone chart sheets and complex grouped items may not be available there.
+Accepted extensions: `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xltx`, `.xltm`, `.xlt`. **Actual import support depends on the chosen renderer.** The native Excel backend searches embedded charts, chart-bearing grouped drawing objects where accessible, and standalone chart sheets. LibreOffice enumerates embedded Calc chart shapes (including some grouped charts); Gnumeric exports imported graph objects. Neither open-source backend currently promises extraction from standalone Excel chart sheets. Pasted images of charts, sparklines, and non-chart shapes are out of scope. The Aspose backend enumerates worksheet charts; chart sheets and complex groups may be unsupported.
 
 ## Validation and failure reporting
 
-The tool writes `manifest.json` to the output root. It includes the source workbook, chart and worksheet names, output filename, target format, rendering method, record/element counts, failure messages, and totals.
+The tool writes `manifest.json` to the output root. It includes the source workbook, chart and worksheet names, filename, target format, rendering method, SVG/EMF vector and raster element counts, **naming source** (`backend`, `libreoffice`, `ooxml_position`, or `gnumeric_sheet_index`), errors, warnings, and totals.
 
 ```json
 {
@@ -156,7 +205,16 @@ python -m pip install -e '.[windows,test]'
 python -m pytest -q
 ```
 
-On Linux, `pywin32` is skipped by the platform dependency marker. The Inkscape tests skip when Inkscape is unavailable. GitHub Actions runs the portable tests on Windows and Ubuntu. **GitHub-hosted Windows runners do not supply Microsoft Excel**, so Excel automation is validated separately using the [Windows smoke test](scripts/smoke-test-windows.ps1).
+For the **real LibreOffice end-to-end test** on Linux:
+
+```bash
+sudo apt install libreoffice-calc python3-uno
+EXCEL_CHART_LIVE_LO=1 python -m pytest -q -m integration
+```
+
+A separate GitHub Actions job runs this test on Ubuntu. It checks the synthetic workbook's **47 chart objects and 94 vector files**. Gnumeric's subprocess and naming logic have automated tests, but the real `ssconvert` rendering results depend on the installed version; run `scripts/smoke-test-gnumeric.sh` to assess its import coverage on your machine. The script **fails loudly** if Gnumeric misses any of the fixture's 47 charts.
+
+On Linux, `pywin32` is skipped by the platform dependency marker. The Inkscape tests skip when Inkscape is unavailable. GitHub Actions runs portable tests on Windows and Ubuntu and a live LibreOffice integration job on Ubuntu. **GitHub-hosted Windows runners do not supply Microsoft Excel**, so Excel automation is validated separately using the [Windows smoke test](scripts/smoke-test-windows.ps1).
 
 On a Windows machine with Excel installed:
 
@@ -172,14 +230,18 @@ The smoke test runs both formats on the included workbook and checks that 47 cha
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Expected a single-chart PDF, but Excel printed N page(s)` | Upgrade from v1.0 to this release; use `--show-excel`. The activated-chart method and temporary chart-sheet fallback are intended to prevent worksheet printing. |
 | No `CF_ENHMETAFILE` clipboard data                         | Run in an interactive Windows desktop session, do not copy to the clipboard during export, try `--show-excel`, or install Inkscape for fallback conversion.      |
-| Font or layout differs from Excel                          | On Windows prefer `--engine excel`; install required fonts. Aspose or Inkscape conversion may differ visually.                                                   |
+| Font or layout differs from Excel                          | For closest original styling on Windows prefer `--engine excel`; install fonts. LibreOffice, Gnumeric and Aspose use their own layout engines and may differ.    |
 | SVG rejected as raster-only                                | Check if the original chart uses embedded pictures or effects. Use `--allow-raster` only if raster-based output is acceptable.                                   |
 | A chart is missing                                         | Review `manifest.json`, try `--show-excel`, and check unsupported chart structures. `--no-audit` suppresses the count check but does not recover omitted charts. |
-| Some files exported, others failed                         | Examine the per-chart `errors` and `render_method` fields in `manifest.json`. The tool keeps successful files.                                                   |
+| Some files exported, others failed                         | Examine per-chart `errors`, `render_method`, and `name_source` in `manifest.json`. Successful outputs are retained.                                              |
+| LibreOffice: UNO bridge not found                          | Install `python3-uno` (Linux), or supply a compatible interpreter using `--uno-python`. `soffice` must also be installed.                                        |
+| Gnumeric: `ssconvert` missing                              | Install `gnumeric` on Linux/WSL2, or supply the executable via `--ssconvert`.                                                                                    |
+| EMF unavailable with Gnumeric                              | Install Inkscape or choose `--format svg`. Gnumeric itself does not export EMF.                                                                                  |
+| LibreOffice EMF record-count warning                       | A known one-record mismatch was observed in valid, vector-rich EMF output; it is accepted only for this backend.                                                 |
 
 ## Privacy, limits and security
 
-No web service is used to render or upload the workbook. The program invokes local software (Excel, PyMuPDF, optional Inkscape or Aspose). Be cautious with untrusted Excel files; macro execution is disabled in the native backend, but Office files and third-party renderers still need security patching. Do not commit workbooks containing private business data, or an Aspose license file, to GitHub.
+No web service is used to render or upload the workbook. The program invokes local software (Excel, LibreOffice, Gnumeric, PyMuPDF, optional Inkscape, or Aspose). LibreOffice uses an isolated, loopback-only UNO listener and a temporary user profile. Be cautious with untrusted Excel files; macro execution is disabled in the native backend, but Office files and third-party renderers still need security patching. Do not commit workbooks containing private business data, or an Aspose license file, to GitHub.
 
 Excel on Windows runs in a **separate automated application instance**. The tool reads specified files rather than enumerating all files currently open in Excel. This project exports *rendered chart graphics*, not the underlying editable Excel chart object or series data.
 
@@ -189,16 +251,18 @@ Excel on Windows runs in a **separate automated application instance**. The tool
 
 The project acknowledges these software projects and their maintainers:
 
-| Component                                     | Role                                                   | License or terms                                                                           | Project                                              |
-| --------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------- |
-| **PyMuPDF / MuPDF** (Artifex Software)        | Excel PDF to SVG; PDF inspection                       | **AGPL-3.0 or commercial license**. Important for closed-source/commercial redistribution. | https://pymupdf.io/licensing                         |
-| **pywin32** (Mark Hammond and contributors)   | Windows Excel COM automation and EMF clipboard access  | Python Software Foundation License                                                         | https://pypi.org/project/pywin32/                    |
-| **Aspose.Cells for Python via Java** (Aspose) | Optional Excel-independent SVG/EMF backend             | Proprietary commercial licensing; evaluation limitations                                   | https://docs.aspose.com/cells/python-java/licensing/ |
-| **JPype1** (Steve Menard and contributors)    | Java bridge used by the optional Aspose backend        | Apache-2.0                                                                                 | https://pypi.org/project/jpype1/                     |
-| **Inkscape** (Inkscape contributors)          | Optional SVG-to-EMF fallback                           | Open-source GPL terms (refer to upstream distribution)                                     | https://inkscape.org/                                |
-| **pytest** (pytest contributors)              | Automated tests; development-only                      | MIT                                                                                        | https://docs.pytest.org/en/stable/license.html       |
-| **setuptools** (Python Packaging Authority)   | Python build/install tooling; build-time only          | MIT                                                                                        | https://pypi.org/project/setuptools/                 |
-| **Microsoft Excel** (Microsoft)               | Native chart renderer on Windows; installed separately | Commercial Microsoft software terms                                                        | https://www.microsoft.com/microsoft-365/excel        |
+| Component                                                             | Role                                                   | License or terms                                                                           | Project                                              |
+| --------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------- |
+| **PyMuPDF / MuPDF** (Artifex Software)                                | Excel PDF to SVG; PDF inspection                       | **AGPL-3.0 or commercial license**. Important for closed-source/commercial redistribution. | https://pymupdf.io/licensing                         |
+| **pywin32** (Mark Hammond and contributors)                           | Windows Excel COM automation and EMF clipboard access  | Python Software Foundation License                                                         | https://pypi.org/project/pywin32/                    |
+| **LibreOffice Calc / UNO** (The Document Foundation and contributors) | Open-source Excel-independent SVG/EMF renderer         | MPL 2.0 and LGPL 3.0+ as distributed by the project                                        | https://www.libreoffice.org/about-us/licenses/       |
+| **Gnumeric / ssconvert** (Gnumeric and GNOME contributors)            | Open-source XLSX reader and SVG chart exporter         | GPL v2/v3 (see distribution's licensing)                                                   | https://www.gnumeric.org/                            |
+| **Aspose.Cells for Python via Java** (Aspose)                         | Optional Excel-independent SVG/EMF backend             | Proprietary commercial licensing; evaluation limitations                                   | https://docs.aspose.com/cells/python-java/licensing/ |
+| **JPype1** (Steve Menard and contributors)                            | Java bridge used by the optional Aspose backend        | Apache-2.0                                                                                 | https://pypi.org/project/jpype1/                     |
+| **Inkscape** (Inkscape contributors)                                  | Optional SVG-to-EMF fallback                           | Open-source GPL terms (refer to upstream distribution)                                     | https://inkscape.org/                                |
+| **pytest** (pytest contributors)                                      | Automated tests; development-only                      | MIT                                                                                        | https://docs.pytest.org/en/stable/license.html       |
+| **setuptools** (Python Packaging Authority)                           | Python build/install tooling; build-time only          | MIT                                                                                        | https://pypi.org/project/setuptools/                 |
+| **Microsoft Excel** (Microsoft)                                       | Native chart renderer on Windows; installed separately | Commercial Microsoft software terms                                                        | https://www.microsoft.com/microsoft-365/excel        |
 
 This repository does not vendor, redistribute or modify third-party binaries. Installing optional dependencies can introduce further transitive dependencies with their own licenses. Verify the terms for your intended use. This licensing summary is informational and is not legal advice.
 
@@ -211,6 +275,9 @@ This repository does not vendor, redistribute or modify third-party binaries. In
 - [Aspose.Cells Chart.toImage](https://reference.aspose.com/cells/python-java/asposecells.api/chart/)
 - [PyMuPDF Page.get_svg_image](https://pymupdf.readthedocs.io/en/latest/page.html)
 - [Inkscape command-line use](https://wiki.inkscape.org/wiki/Using_the_Command_Line)
+- [Gnumeric `ssconvert` manual (including graph SVG exports)](https://manpages.debian.org/testing/gnumeric/ssconvert.1.en.html)
+- [LibreOffice `GraphicExportFilter` UNO API](https://api.libreoffice.org/docs/idl/ref/servicecom_1_1sun_1_1star_1_1drawing_1_1GraphicExportFilter.html)
+- [LibreOffice Calc Guide: chart SVG/EMF export](https://books.libreoffice.org/en/CG262/CG26206-CreatingChartsAndGraphs.html)
 
 ## Development and publication
 

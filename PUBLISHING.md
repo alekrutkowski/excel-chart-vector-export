@@ -4,7 +4,7 @@ The provided ZIP is a complete working tree. It deliberately contains no `.git` 
 
 ## Before making it public
 
-1. Check that `README.md` and `LICENSE` match your intended terms. The project code is MIT-licensed, while PyMuPDF is AGPL/commercial and Aspose.Cells is proprietary; these third-party terms are separate.
+1. Check that `README.md` and `LICENSE` match your intended terms. The project code is MIT-licensed, while PyMuPDF is AGPL/commercial, Aspose.Cells is proprietary, and Gnumeric, LibreOffice and Inkscape have their own open-source license terms; these third-party terms are separate.
 2. Review all files for proprietary or personally identifying data. The bundled example workbook is synthetic. Never commit Aspose license files.
 3. Run portable tests:
 
@@ -13,7 +13,8 @@ The provided ZIP is a complete working tree. It deliberately contains no `.git` 
    py -3 -m pytest -q
    ```
 
-4. On Windows with Microsoft Excel, run the native end-to-end smoke test:
+4. On Linux with LibreOffice installed, run `EXCEL_CHART_LIVE_LO=1 python -m pytest -q -m integration`. The release should produce 47 SVG and 47 EMF files from the test workbook.
+5. On Windows with Microsoft Excel, run the native end-to-end smoke test:
 
    ```powershell
    .\scripts\smoke-test-windows.ps1
@@ -28,7 +29,7 @@ With [Git](https://git-scm.com/) and the optional [GitHub CLI](https://cli.githu
 ```powershell
 git init
 git add .
-git commit -m "Prepare Excel Chart Vector Export v1.2.1 for GitHub"
+git commit -m "Prepare Excel Chart Vector Export v1.3.0 for GitHub"
 gh auth login
 gh repo create excel-chart-vector-export --public --source . --remote origin --push
 ```
@@ -39,7 +40,7 @@ If you already have a GitHub repository, configure its remote and push instead. 
 
 1. Keep the version synchronized in `pyproject.toml` and `excel_charts_to_svg.py`; update `CHANGELOG.md`.
 2. Push all changes and verify the **Tests** GitHub Actions workflow passes.
-3. Create a GitHub release with a matching tag, e.g. `v1.2.1`. The release workflow builds a source distribution and wheel and attaches them to that release.
+3. Create a GitHub release with a matching tag, e.g. `v1.3.0`. The release workflow builds a source distribution and wheel and attaches them to that release.
 4. Describe any outstanding live Excel limitations in the public release notes. This project currently remains beta until full Windows Excel smoke testing is confirmed.
 
 The workflow does not publish to PyPI. PyPI publication is a separate decision and should be taken only after checking package availability, security and all applicable licensing obligations.

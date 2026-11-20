@@ -4,3 +4,6 @@ include extract_charts.bat
 recursive-include examples *.xlsx
 recursive-include tests *.py
 recursive-include scripts *.ps1
+
+include libreoffice_uno_worker.py
+recursive-include scripts *.sh

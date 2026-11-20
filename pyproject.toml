@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "excel-chart-vector-export"
-version = "1.2.1"
-description = "Extract Excel charts into validated SVG and EMF graphics"
+version = "1.3.0"
+description = "Extract Excel charts as validated SVG and EMF, including fully open-source backends"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -36,7 +36,8 @@ test = ["pytest>=8.0"]
 excel-chart-export = "excel_charts_to_svg:main"
 
 [tool.setuptools]
-py-modules = ["excel_charts_to_svg"]
+py-modules = ["excel_charts_to_svg", "libreoffice_uno_worker"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: tests requiring live LibreOffice/UNO installation"]

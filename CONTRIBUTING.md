@@ -8,16 +8,17 @@ Contributions, tests and bug reports are welcome. Contact: **Alek Rutkowski** (a
 python -m venv .venv
 python -m pip install -e '.[windows,test]'
 python -m pytest -q
-python -m compileall -q excel_charts_to_svg.py
+python -m compileall -q excel_charts_to_svg.py libreoffice_uno_worker.py
 ```
 
-On Windows, choose the virtual environment's Python (`.venv\Scripts\python`). The Windows-only `pywin32` dependency is automatically skipped outside Windows. On Linux, Inkscape tests are skipped if its binary is not available.
+On Windows, choose the virtual environment's Python (`.venv\Scripts\python`). The Windows-only `pywin32` dependency is automatically skipped outside Windows. On Linux, Inkscape tests are skipped if its binary is not available. The LibreOffice worker needs a separate Python with `uno` installed; it is tested in CI.
 
 ## Testing changes
 
 - Keep public command-line options backward compatible when practical.
 - Add regression tests for parsing, file naming, SVG/EMF validation, error paths, and partial failures.
 - Do not attach private workbooks. The `examples/` workbook is synthetic and contains 47 embedded Excel charts.
+- On Ubuntu, install `libreoffice-calc python3-uno` and run `EXCEL_CHART_LIVE_LO=1 python -m pytest -q -m integration` to verify actual LibreOffice SVG/EMF outputs. Gnumeric needs the `gnumeric` system package (and Inkscape for EMF).
 - Excel COM integration requires Windows with desktop Excel installed. Run `scripts/smoke-test-windows.ps1` and report Excel version, Python version, output summary and any sanitized failure messages.
 - The native EMF path temporarily uses the Windows clipboard. Avoid testing it while other software is copying to the clipboard.
 

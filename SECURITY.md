@@ -8,8 +8,9 @@ Security fixes are intended for the latest published version; earlier releases a
 
 ## Safety considerations
 
-- Avoid processing workbooks from untrusted sources unless Microsoft Excel and all rendering dependencies are fully patched.
+- Avoid processing workbooks from untrusted sources unless Microsoft Excel, LibreOffice, Gnumeric, and all rendering dependencies are fully patched.
 - The native backend disables macros and suppresses external-link refresh, but rendering third-party Office documents still has risks.
+- LibreOffice uses a temporary profile and a UNO listener bound only to the local loopback interface. Avoid running untrusted processes under the same OS account while the listener is active.
 - Native EMF extraction uses the Windows clipboard and replaces its current contents.
 - The included source does not upload workbook contents to a remote service.
 - SVG output is inspected for external links, scripting elements and event-handler attributes; treat SVG from untrusted sources as potentially active content until independently checked.

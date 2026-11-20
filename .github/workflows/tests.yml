@@ -51,3 +51,24 @@ jobs:
         run: python -m pip install -e ".[windows,test]"
       - name: Verify real Inkscape fallback
         run: python -m pytest -q tests/test_tool.py -k 'real_inkscape or excel_emf_fallback'
+
+  libreoffice-integration:
+    name: Real LibreOffice SVG and EMF integration on Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install LibreOffice and its Python UNO bridge
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-calc python3-uno
+      - name: Install package and tests
+        run: python -m pip install -e '.[test]'
+      - name: Live 47-chart / 94-vector-file test
+        env:
+          EXCEL_CHART_LIVE_LO: '1'
+        run: python -m pytest -q -m integration
