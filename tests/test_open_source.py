@@ -160,6 +160,116 @@ def test_emf_libreoffice_known_off_by_one_allowed_only_with_opt_in(tmp_path):
     assert info.vector_elements > 0
 
 
+def test_libreoffice_worker_renders_emf_when_svg_only_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_export(smgr, context, shape, target, extension):
+        calls.append(extension)
+        if extension == "svg":
+            raise RuntimeError("GraphicExportFilter refuses SVG")
+        target.write_bytes(b"EMF" * 40)
+
+    monkeypatch.setattr(worker, "export_one", fake_export)
+    result = worker.export_chart_files(None, None, None, tmp_path, 0, 1, ["svg"])
+    assert calls == ["svg", "emf"]
+    assert "svg" not in result["files"]
+    assert result["errors"]["svg"] == "GraphicExportFilter refuses SVG"
+    assert Path(result["fallback_emf"]).is_file()
+
+
+def test_libreoffice_worker_reuses_requested_emf_for_failed_svg(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_export(smgr, context, shape, target, extension):
+        calls.append(extension)
+        if extension == "svg":
+            raise RuntimeError("SVG unavailable")
+        target.write_bytes(b"EMF" * 40)
+
+    monkeypatch.setattr(worker, "export_one", fake_export)
+    result = worker.export_chart_files(None, None, None, tmp_path, 0, 1, ["svg", "emf"])
+    assert calls == ["svg", "emf"]
+    assert "fallback_emf" not in result
+    assert "emf" in result["files"]
+
+
+def test_libreoffice_worker_does_not_generate_emf_when_svg_succeeds(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_export(smgr, context, shape, target, extension):
+        calls.append(extension)
+        target.write_text("<svg xmlns='http://www.w3.org/2000/svg'>"
+                          "<path d='M 0 0 L 10 10'/></svg>", encoding="utf-8")
+
+    monkeypatch.setattr(worker, "export_one", fake_export)
+    result = worker.export_chart_files(None, None, None, tmp_path, 0, 1, ["svg"])
+    assert calls == ["svg"]
+    assert "fallback_emf" not in result
+    assert "svg" in result["files"]
+
+
+def test_libreoffice_backend_uses_inkscape_for_missing_svg(tmp_path, monkeypatch):
+    intermediate = tmp_path / "chart.emf"
+    intermediate.write_bytes(b"EMF" * 40)
+    backend = object.__new__(tool.LibreOfficeBackend)
+    backend.inkscape = Path("/fake/inkscape")
+    spec = tool.ChartSpec("Sheet", "Chart", "Title", 1, {
+        "files": {"emf": str(intermediate)},
+        "errors": {"svg": "LibreOffice failed to render image/svg+xml"},
+    })
+
+    def fake_convert(emf, svg, executable):
+        assert emf == intermediate
+        assert executable == backend.inkscape
+        svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" '
+                       'height="100"><path d="M 10 10 L 90 90"/></svg>',
+                       encoding="utf-8")
+
+    monkeypatch.setattr(tool, "inkscape_emf_to_svg", fake_convert)
+    svg = tmp_path / "out.svg"
+    assert backend.render(spec, svg) == "libreoffice_inkscape_emf_svg"
+    assert tool.svg_inspect_and_label(svg, title="Title", description="Sheet",
+                                      require_vector=True).vector_elements > 0
+
+
+def test_libreoffice_backend_reports_missing_inkscape_with_native_error(tmp_path):
+    intermediate = tmp_path / "chart.emf"
+    intermediate.write_bytes(b"EMF" * 40)
+    backend = object.__new__(tool.LibreOfficeBackend)
+    backend.inkscape = None
+    spec = tool.ChartSpec("Sheet", "Chart", "Title", 1, {
+        "files": {}, "fallback_emf": str(intermediate),
+        "errors": {"svg": "LibreOffice SVG export was unsuccessful"},
+    })
+    with pytest.raises(tool.ExtractionError, match="requires Inkscape") as exc:
+        backend.render(spec, tmp_path / "chart.svg")
+    assert "SVG export was unsuccessful" in str(exc.value)
+
+
+@pytest.mark.skipif(tool.inkscape_executable(None) is None,
+                    reason="Real Inkscape not installed")
+def test_real_inkscape_emf_to_svg_fallback(tmp_path):
+    """Use an actual EMF derived from the bundled xlsx via LibreOffice."""
+    if not shutil.which("soffice") and not shutil.which("libreoffice"):
+        pytest.skip("Real LibreOffice not installed")
+    # Export one of the real chart EMFs through the production backend.
+    backend = tool.LibreOfficeBackend(formats=("emf",), timeout=120)
+    try:
+        chart = next(iter(backend.open(FIXTURE)))
+        emf = tmp_path / "chart.emf"
+        backend.render(chart, emf)
+        info = tool.emf_inspect(emf, allow_lo_record_discrepancy=True)
+        assert info.vector_elements > 0
+        svg = tmp_path / "chart.svg"
+        tool.inkscape_emf_to_svg(emf, svg, tool.inkscape_executable(None))
+        svg_info = tool.svg_inspect_and_label(svg, title="real", description="fixture",
+                                              require_vector=True)
+        assert svg_info.vector_elements > 0
+        assert svg_info.external_images == 0
+    finally:
+        backend.close()
+
+
 def test_gnumeric_error_if_missing_executable(tmp_path):
     with pytest.raises(tool.ExtractionError, match="ssconvert"):
         tool.GnumericBackend(executable=tmp_path / "no-such-file")
@@ -172,6 +282,46 @@ def test_open_source_engine_cli_options_available(capsys):
     text = capsys.readouterr().out
     assert "gnumeric" in text and "libreoffice" in text
     assert "--uno-python" in text and "--ssconvert" in text
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not os.environ.get("EXCEL_CHART_LIVE_LO"),
+                    reason="Set EXCEL_CHART_LIVE_LO=1 to run LibreOffice integration")
+def test_live_libreoffice_forced_svg_failure_uses_real_vector_fallback(tmp_path):
+    """End-to-end reproduction of the CI failure regardless of LO release.
+
+    Only the test's *temporary copy* of the UNO helper is altered. All real
+    LibreOffice/UNO and Inkscape operations run normally for the EMF fallback.
+    """
+    if tool.inkscape_executable(None) is None:
+        pytest.skip("Inkscape is required for forced SVG failure integration test")
+    content = Path(worker.__file__).read_text(encoding="utf-8")
+    target = ('def export_one(smgr, context, shape, target: Path, extension: str):\n'
+              '    import uno\n')
+    assert content.count(target) == 1
+    altered = content.replace(target, target + (
+        '    if extension == "svg":\n'
+        '        raise RuntimeError("Simulated missing LibreOffice SVG export filter")\n'), 1)
+    temp_helper = tmp_path / "uno_worker_svg_failure.py"
+    temp_helper.write_text(altered, encoding="utf-8")
+    backend = tool.LibreOfficeBackend(formats=("svg",), timeout=240)
+    backend.helper = temp_helper
+    try:
+        specs = backend.open(FIXTURE)
+        assert len(specs) == 47
+        first = specs[0]
+        assert "svg" not in first.chart["files"]
+        assert Path(first.chart["fallback_emf"]).is_file()
+        assert "Simulated missing" in first.chart["errors"]["svg"]
+        dest = tmp_path / "fallback.svg"
+        assert backend.render(first, dest) == "libreoffice_inkscape_emf_svg"
+        info = tool.svg_inspect_and_label(dest, title=first.title,
+                                          description="forced SVG fallback",
+                                          require_vector=True)
+        assert info.vector_elements > 0
+        assert info.external_images == 0
+    finally:
+        backend.close()
 
 
 @pytest.mark.integration

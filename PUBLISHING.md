@@ -29,7 +29,7 @@ With [Git](https://git-scm.com/) and the optional [GitHub CLI](https://cli.githu
 ```powershell
 git init
 git add .
-git commit -m "Prepare Excel Chart Vector Export v1.3.0 for GitHub"
+git commit -m "Prepare Excel Chart Vector Export v1.3.1 for GitHub"
 gh auth login
 gh repo create excel-chart-vector-export --public --source . --remote origin --push
 ```
@@ -40,7 +40,7 @@ If you already have a GitHub repository, configure its remote and push instead. 
 
 1. Keep the version synchronized in `pyproject.toml` and `excel_charts_to_svg.py`; update `CHANGELOG.md`.
 2. Push all changes and verify the **Tests** GitHub Actions workflow passes.
-3. Create a GitHub release with a matching tag, e.g. `v1.3.0`. The release workflow builds a source distribution and wheel and attaches them to that release.
+3. Create a GitHub release with a matching tag, e.g. `v1.3.1`. The release workflow builds a source distribution and wheel and attaches them to that release.
 4. Describe any outstanding live Excel limitations in the public release notes. This project currently remains beta until full Windows Excel smoke testing is confirmed.
 
 The workflow does not publish to PyPI. PyPI publication is a separate decision and should be taken only after checking package availability, security and all applicable licensing obligations.

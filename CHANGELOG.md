@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.1] - 2026-11-20
+
+- Fix the GitHub Actions LibreOffice integration failure: `libreoffice-calc` alone did not install the SVG export filter from `libreoffice-draw`, producing 47 EMFs but zero SVGs on Ubuntu 26.04.
+- Install LibreOffice Draw and Inkscape in the live CI job; exercise both Ubuntu 24.04 and 26.04 instead of silently following `ubuntu-latest`.
+- If LibreOffice's native SVG filter fails, export native vector EMF and optionally convert it to **real SVG** with Inkscape, for both SVG-only and dual-format requests. No raster wrapper is generated.
+- Record `libreoffice_inkscape_emf_svg` in the manifest and warn when fallback conversion is used.
+- Add regression tests for missing native SVG, vector fallback, and the output of a real EMF-to-SVG conversion.
+- Update dependency and troubleshooting guidance in the README. GitHub-hosted live CI for this release is not yet verified.
+
 ## [1.3.0] - 2026-11-19
 
 - Add fully open-source `--engine libreoffice`: headless LibreOffice UNO chart-by-chart SVG and native EMF export, using an isolated profile and the real `GraphicExportFilter`.

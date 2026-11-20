@@ -555,7 +555,7 @@ def test_svg_mode_still_default(tmp_path, monkeypatch):
     # Existing signature callers need not provide output_format.
     spec = tool.ChartSpec('A', 'Chart 1', 'KPI', 1, None)
     assert tool.unique_output(tmp_path, spec, set()).suffix == '.svg'
-    assert tool.VERSION == '1.3.0'
+    assert tool.VERSION == '1.3.1'
 
 
 def test_real_inkscape_converts_svg_to_genuine_vector_emf(tmp_path):

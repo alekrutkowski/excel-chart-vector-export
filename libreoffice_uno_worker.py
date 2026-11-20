@@ -110,6 +110,35 @@ def export_one(smgr, context, shape, target: Path, extension: str):
         raise RuntimeError(f"LibreOffice failed to render {media}")
 
 
+def export_chart_files(smgr, context, shape, output: Path, sheet_index: int,
+                       chart_index: int, formats: list[str]) -> dict:
+    """Export the requested formats and prepare EMF for a failed native SVG.
+
+    The calling process can turn a successful EMF into an SVG with Inkscape.
+    Exporting EMF here, before disposing of the chart/document, also covers
+    SVG-only requests and avoids another costly workbook import.
+    """
+    result = {"files": {}, "errors": {}}
+    for extension in formats:
+        target = output / f"chart_{sheet_index:04d}_{chart_index:05d}.{extension}"
+        try:
+            export_one(smgr, context, shape, target, extension)
+            result["files"][extension] = str(target)
+        except Exception as exc:
+            result["errors"][extension] = str(exc)
+    if "svg" in result["errors"] and "emf" not in formats:
+        # Only a failed SVG request triggers the extra EMF export; successful
+        # native SVGs never incur this work. When both formats are requested,
+        # the existing EMF result is reused without exporting it twice.
+        target = output / f"chart_{sheet_index:04d}_{chart_index:05d}.emf"
+        try:
+            export_one(smgr, context, shape, target, "emf")
+            result["fallback_emf"] = str(target)
+        except Exception as exc:
+            result["errors"]["fallback_emf"] = str(exc)
+    return result
+
+
 def run(port: int, input_file: Path, output: Path, formats: list[str]) -> dict:
     import uno
     context, smgr = connect(port)
@@ -136,15 +165,9 @@ def run(port: int, input_file: Path, output: Path, formats: list[str]) -> dict:
                 chart_index += 1
                 title = title_from_model(shape)
                 record = {"sheet": sheet_name, "object_name": str(shape.Name or "Chart"),
-                          "title": title, "position": chart_index,
-                          "chart_type": "", "files": {}, "errors": {}}
-                for extension in formats:
-                    outfile = output / f"chart_{s:04d}_{chart_index:05d}.{extension}"
-                    try:
-                        export_one(smgr, context, shape, outfile, extension)
-                        record["files"][extension] = str(outfile)
-                    except Exception as exc:
-                        record["errors"][extension] = str(exc)
+                          "title": title, "position": chart_index, "chart_type": ""}
+                record.update(export_chart_files(smgr, context, shape, output,
+                                                 s, chart_index, formats))
                 result["charts"].append(record)
     finally:
         # Close the read-only document, never save or alter the original file.

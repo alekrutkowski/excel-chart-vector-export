@@ -4,7 +4,8 @@
 Windows: native Excel COM -> one-chart PDF -> SVG via PyMuPDF;
          chart picture clipboard -> native EMF (with optional Inkscape fallback).
 Cross-platform: optional licensed Aspose.Cells for Python via Java -> SVG/EMF.
-Open source: LibreOffice UNO -> SVG/EMF, Gnumeric ssconvert -> SVG
+Open source: LibreOffice UNO -> SVG/EMF (EMF-to-SVG Inkscape fallback if
+             an installed LibreOffice cannot export SVG), Gnumeric -> SVG
              (EMF through optional Inkscape).
 
 The source workbook is always opened read-only and is never saved.
@@ -35,7 +36,7 @@ from uuid import uuid4
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 EXTENSIONS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".xltx", ".xltm", ".xlt"}
 SVG_NS = "http://www.w3.org/2000/svg"
 XL_WORKSHEET = -4167
@@ -654,6 +655,25 @@ def inkscape_svg_to_emf(svg: Path, emf: Path, executable: Path) -> None:
         raise ExtractionError(f"Inkscape could not export EMF ({detail})")
 
 
+def inkscape_emf_to_svg(emf: Path, svg: Path, executable: Path) -> None:
+    """Import a real vector EMF and save as a genuine SVG using Inkscape.
+
+    LibreOffice 26.2 may export chart EMF successfully while its native UNO
+    GraphicExportFilter refuses SVG. This fallback preserves vector drawing
+    commands rather than embedding a bitmap in an SVG container. The caller
+    still performs the usual strict SVG validation before saving the output.
+    """
+    command = [str(executable), str(emf), f"--export-filename={svg}"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ExtractionError(f"Inkscape EMF-to-SVG conversion failed: {exc}") from exc
+    if result.returncode or not svg.is_file() or svg.stat().st_size < 100:
+        detail = (result.stderr or result.stdout or "no SVG produced").strip()
+        raise ExtractionError(f"Inkscape could not convert LibreOffice EMF to SVG ({detail})")
+
+
 def pdf_to_svg(pdf: Path, svg: Path, *, crop: str, keep_text: bool) -> None:
     """Convert a one-page PDF to true vector SVG, with optional ink-bound cropping."""
     try:
@@ -1137,12 +1157,14 @@ class LibreOfficeBackend:
 
     Uses an isolated headless LibreOffice profile and a separate helper Python
     with a working `uno` module, without importing UNO into the caller's env.
-    Both SVG and EMF use native GraphicExportFilter vector MIME types.
+    SVG and EMF normally use native GraphicExportFilter vector MIME types.
+    If SVG fails but EMF succeeds, Inkscape may convert EMF back to real SVG.
     """
     name = "libreoffice"
 
     def __init__(self, *, soffice_path: Path | None = None,
                  uno_python: Path | None = None,
+                 inkscape_path: Path | None = None,
                  formats: tuple[str, ...] = ("svg",), timeout: int = 300):
         self.soffice = str(soffice_path) if soffice_path else (
             shutil.which("soffice") or shutil.which("libreoffice"))
@@ -1157,6 +1179,7 @@ class LibreOfficeBackend:
             raise ExtractionError("LibreOffice backend helper libreoffice_uno_worker.py "
                                   "must be installed next to excel_charts_to_svg.py")
         self.formats = formats
+        self.inkscape = inkscape_executable(inkscape_path)
         self.timeout = timeout
         self._scratch = tempfile.TemporaryDirectory(prefix="libreoffice-charts-")
         self._folders: list[Path] = []
@@ -1213,8 +1236,25 @@ class LibreOfficeBackend:
         ext = destination.suffix.lstrip(".").lower()
         item = spec.chart
         if ext not in item["files"]:
-            raise ExtractionError(item.get("errors", {}).get(ext) or
-                                  f"LibreOffice did not export the chart as {ext}")
+            native_error = item.get("errors", {}).get(ext) or (
+                f"LibreOffice did not export the chart as {ext}")
+            if ext == "svg":
+                # The helper has already rendered an intermediate EMF when
+                # the native SVG filter failed, even in SVG-only mode.
+                emf_file = item["files"].get("emf") or item.get("fallback_emf")
+                if emf_file:
+                    if self.inkscape is None:
+                        raise ExtractionError(
+                            f"{native_error}; an EMF was exported, but converting "
+                            "it to SVG requires Inkscape (install it or pass --inkscape PATH). "
+                            "Also check that LibreOffice Draw's SVG filter is installed "
+                            "(Ubuntu: sudo apt install libreoffice-draw)")
+                    inkscape_emf_to_svg(Path(emf_file), destination, self.inkscape)
+                    return "libreoffice_inkscape_emf_svg"
+                detail = item.get("errors", {}).get("fallback_emf")
+                if detail:
+                    native_error += f"; EMF fallback also failed: {detail}"
+            raise ExtractionError(native_error)
         source = Path(item["files"][ext])
         if not source.is_file():
             raise ExtractionError(f"LibreOffice export disappeared: {source}")
@@ -1260,6 +1300,7 @@ def backend_for(engine: str, *, crop: str, keep_text: bool,
                                formats=formats, timeout=timeout)
     if engine == "libreoffice":
         return LibreOfficeBackend(soffice_path=soffice_path, uno_python=uno_python,
+                                  inkscape_path=inkscape_path,
                                   formats=formats, timeout=timeout)
     if engine != "auto":
         raise ExtractionError(f"Unknown rendering engine: {engine}")
@@ -1273,7 +1314,7 @@ def backend_for(engine: str, *, crop: str, keep_text: bool,
     for name, create in (
         ("LibreOffice", lambda: LibreOfficeBackend(
             soffice_path=soffice_path, uno_python=uno_python,
-            formats=formats, timeout=timeout)),
+            inkscape_path=inkscape_path, formats=formats, timeout=timeout)),
         ("Gnumeric", lambda: GnumericBackend(
             executable=ssconvert_path, inkscape_path=inkscape_path,
             formats=formats, timeout=timeout)),
@@ -1396,6 +1437,13 @@ def process(inputs: list[Path], *, output: Path, engine: str, crop: str,
                                     report["warnings"].append(
                                         f"{dst}: EMF made from Excel PDF/SVG via Inkscape "
                                         "because native Excel clipboard EMF was unavailable")
+                                if render_method == "libreoffice_inkscape_emf_svg":
+                                    warning = (
+                                        "LibreOffice's native SVG exporter failed: "
+                                        "SVG was converted from native vector EMF using Inkscape. "
+                                        "Review visual fidelity when comparing with Excel.")
+                                    if warning not in report["warnings"]:
+                                        report["warnings"].append(warning)
                                 if spec.name_source == "ooxml_position":
                                     if not any("OOXML positional naming" in w for w in report["warnings"]):
                                         report["warnings"].append(
@@ -1486,7 +1534,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Output vector format(s); SVG-only preserves previous behavior")
     parser.add_argument("--aspose-license", type=Path, help="Path to an Aspose.Cells license file")
     parser.add_argument("--inkscape", type=Path,
-                        help="Optional Inkscape executable used if native Excel EMF clipboard export fails")
+                        help="Optional Inkscape executable: Excel SVG-to-EMF, Gnumeric EMF, or LibreOffice EMF-to-SVG fallback")
     parser.add_argument("--crop", choices=["auto", "none"], default="auto",
                         help="Trim printer whitespace for native Excel PDF export")
     parser.add_argument("--keep-text", action="store_true", help="Keep live SVG text instead of portable font outlines")
